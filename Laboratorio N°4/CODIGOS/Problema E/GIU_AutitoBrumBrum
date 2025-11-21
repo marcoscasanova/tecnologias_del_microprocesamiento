@@ -1,1 +1,583 @@
+import sys
+import serial
+import serial.tools.list_ports
+import threading
+from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal, QObject
+from PyQt5.QtGui import QPainter, QColor, QFont, QPen
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QVBoxLayout,
+    QHBoxLayout, QPushButton, QComboBox, QFrame, QSlider
+)
 
+# ======================================================
+#   SerialThread – hilo seguro (NO BLOQUEA LA GUI)
+# ======================================================
+
+class SerialThread(QObject):
+    received = pyqtSignal(str)
+    status = pyqtSignal(str)   # "connected", "error", "closed"
+
+    def __init__(self, port, baud=9600):
+        super().__init__()
+        self.port = port
+        self.baud = baud
+        self.running = False
+        self.ser = None
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def connect(self):
+        if self.thread and self.thread.is_alive():
+            return
+
+        def run():
+            try:
+                self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                self.running = True
+                self.status.emit("connected")
+
+                while self.running:
+                    try:
+                        line = self.ser.readline().decode(errors="ignore").strip()
+                        if line:
+                            self.received.emit(line)
+                    except:
+                        self.status.emit("error")
+                        break
+
+                self._close_internal()
+
+            except:
+                self.status.emit("error")
+                self._close_internal()
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def send(self, msg):
+        if not self.ser:
+            return
+        try:
+            with self.lock:
+                self.ser.write(msg.encode())
+        except:
+            self.status.emit("error")
+
+    def close(self):
+        self.running = False
+
+    def _close_internal(self):
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except:
+            pass
+        self.ser = None
+        self.status.emit("closed")
+
+# ======================================================
+#   Lista de puertos
+# ======================================================
+
+def listar_puertos():
+    return [f"{p.device} ({p.description})"
+            for p in serial.tools.list_ports.comports()]
+
+# ======================================================
+#   Joystick
+# ======================================================
+
+class Joystick(QWidget):
+    moved = pyqtSignal(int, int)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(260, 260)
+        self.center = QPoint(130, 130)
+        self.knob = QPoint(130, 130)
+        self.r = 95
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        p.fillRect(self.rect(), QColor(20, 20, 20))
+
+        p.setBrush(QColor(35, 35, 35))
+        p.setPen(QPen(QColor(80, 80, 80), 3))
+        p.drawEllipse(self.center, self.r, self.r)
+
+        p.setPen(QPen(QColor(60, 60, 60), 1, Qt.DashLine))
+        p.drawLine(self.center.x()-self.r, self.center.y(),
+                   self.center.x()+self.r, self.center.y())
+        p.drawLine(self.center.x(), self.center.y()-self.r,
+                   self.center.x(), self.center.y()+self.r)
+
+        p.setBrush(QColor(0,160,255))
+        p.setPen(QPen(QColor(200,200,200),1))
+        p.drawEllipse(self.knob,26,26)
+
+    def mouseMoveEvent(self, event):
+        dx = event.x() - self.center.x()
+        dy = event.y() - self.center.y()
+        dist = (dx*dx + dy*dy)**0.5
+
+        if dist > self.r:
+            dx *= self.r/dist
+            dy *= self.r/dist
+
+        self.knob = QPoint(int(self.center.x()+dx),
+                           int(self.center.y()+dy))
+        self.update()
+
+        self.moved.emit(int((dx/self.r)*100),
+                        int(-(dy/self.r)*100))
+
+    def mouseReleaseEvent(self, event):
+        self.knob = QPoint(self.center)
+        self.update()
+        self.moved.emit(0,0)
+
+# ======================================================
+#   Ventana Principal
+# ======================================================
+
+class Window(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Control Autito – HC-05")
+        self.serial_thread = None
+        self.connected = False
+
+        self.L = 0
+        self.R = 0
+        self.last_Lpwm = 999
+        self.last_Rpwm = 999
+
+        # WASD
+        self.movement_keys = set()
+        self.override_pwm = False
+        self.L_dir = 0
+        self.R_dir = 0
+
+        # Luz (toggle)
+        self.light_on = False
+
+        # Timer
+        self.timer_send = QTimer()
+        self.timer_send.timeout.connect(self.enviar)
+        self.timer_send.start(50)
+
+        self.set_theme()
+        self.build_ui()
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    # --------------------------------------------------
+    def set_theme(self):
+        self.setStyleSheet("""
+            QWidget { background:#111315; color:#F5F5F5; }
+            QLabel { color:#F5F5F5; }
+            QPushButton {
+                background:#1E2228; color:white;
+                padding:10px; border-radius:6px;
+                border:1px solid #333;
+                font-weight:bold;
+            }
+            QPushButton:hover { background:#272C34; }
+            QSlider::groove:horizontal {
+                height:6px; background:#333; border-radius:3px;
+            }
+            QSlider::handle:horizontal {
+                width:14px; background:#0A84FF;
+                margin:-4px 0; border-radius:7px;
+            }
+        """)
+
+    # --------------------------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.setFocus()
+
+    # --------------------------------------------------
+    def build_ui(self):
+        root = QVBoxLayout()
+        root.setContentsMargins(12,12,12,12)
+
+        # HEADER
+        header = QHBoxLayout()
+
+        title = QLabel("⚽ Control Autito Bluetooth")
+        title.setFont(QFont("Segoe UI",16,QFont.Bold))
+
+        self.lbl_estado = QLabel("Desconectado")
+        self.lbl_estado.setStyleSheet("color:#FF5555;")
+
+        left = QVBoxLayout()
+        left.addWidget(title)
+        left.addWidget(self.lbl_estado)
+
+        header.addLayout(left)
+        header.addStretch()
+
+        self.cmb = QComboBox()
+        self.cmb.setFixedWidth(220)
+        self.cmb.addItems(listar_puertos())
+
+        self.btn_r = QPushButton("↻ Puertos")
+        self.btn_r.clicked.connect(self.refrescar)
+
+        self.btn_c = QPushButton("Conectar")
+        self.btn_c.clicked.connect(self.toggle_conexion)
+
+        header.addWidget(self.cmb)
+        header.addWidget(self.btn_r)
+        header.addWidget(self.btn_c)
+
+        root.addLayout(header)
+
+        # SEPARADOR
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#333;")
+        root.addWidget(sep)
+
+        # MAIN LAYOUT
+        center = QHBoxLayout()
+        left_col = QVBoxLayout()
+
+        self.lbl_mov = QLabel("Detenido")
+        self.lbl_mov.setFont(QFont("Segoe UI",20,QFont.Bold))
+        self.lbl_mov.setAlignment(Qt.AlignCenter)
+
+        self.joy = Joystick()
+        self.joy.moved.connect(self.procesar_joy)
+
+        left_col.addWidget(self.lbl_mov)
+        left_col.addWidget(self.joy, alignment=Qt.AlignCenter)
+        center.addLayout(left_col)
+
+        # DERECHA
+        right_col = QVBoxLayout()
+
+        # POWER SLIDER (PWM 127..255)
+        power_frame = QFrame()
+        pl = QVBoxLayout(power_frame)
+
+        self.lbl_power = QLabel("Potencia WASD: 100 %  (PWM 255)")
+        self.lbl_power.setAlignment(Qt.AlignCenter)
+        pl.addWidget(self.lbl_power)
+
+        self.slider_power = QSlider(Qt.Horizontal)
+        self.slider_power.setMinimum(0)
+        self.slider_power.setMaximum(10)
+        self.slider_power.setValue(10)
+        self.slider_power.valueChanged.connect(self.on_power_change)
+        pl.addWidget(self.slider_power)
+
+        right_col.addWidget(power_frame)
+
+        # ACCIONES
+        ac_frame = QFrame()
+        ac = QVBoxLayout(ac_frame)
+
+        ac.addWidget(QLabel("Acciones  -  Q = Bocina, WASD = Mover",
+                            alignment=Qt.AlignCenter))
+
+        # Bocina
+        l = QHBoxLayout()
+        self.btn_horn = QPushButton("Bocina (Q)")
+        self.btn_horn.pressed.connect(self.horn_on)
+        self.btn_horn.released.connect(self.horn_off)
+        l.addWidget(self.btn_horn)
+        ac.addLayout(l)
+
+        # Luz (toggle)
+        l_luz = QHBoxLayout()
+        self.btn_light = QPushButton("Luz OFF")
+        self.btn_light.clicked.connect(self.toggle_light)
+        l_luz.addWidget(self.btn_light)
+        ac.addLayout(l_luz)
+
+        # Golpes (labels intercambiados)
+        l2 = QHBoxLayout()
+        self.btn_left = QPushButton("Golpe Derecha")   # botón izquierdo dice Derecha
+        self.btn_left.clicked.connect(self.kick_left)
+        self.btn_right = QPushButton("Golpe Izquierda")  # botón derecho dice Izquierda
+        self.btn_right.clicked.connect(self.kick_right)
+        l2.addWidget(self.btn_left)
+        l2.addWidget(self.btn_right)
+        ac.addLayout(l2)
+
+        right_col.addWidget(ac_frame)
+        right_col.addStretch()
+
+        center.addLayout(right_col)
+        root.addLayout(center)
+
+        self.setLayout(root)
+        self.update_controls_enabled(False)
+        self.set_connected_ui(False)
+
+    # ======================================================
+    # Conexión
+    # ======================================================
+
+    def set_connected_ui(self, connected):
+        self.connected = connected
+        self.btn_c.setText("Desconectar" if connected else "Conectar")
+        self.cmb.setEnabled(not connected)
+        self.btn_r.setEnabled(not connected)
+
+    def on_serial_status(self, state):
+        if state == "connected":
+            self.lbl_estado.setText("Conectado ✔")
+            self.lbl_estado.setStyleSheet("color:#00FF7F;")
+            self.update_controls_enabled(True)
+            self.set_connected_ui(True)
+            self.serial_thread.send("H:0\n")
+
+            # reset luz a OFF al conectar
+            self.light_on = False
+            self.btn_light.setText("Luz OFF")
+            # si querés, también podés mandar explícitamente LED:0
+            # self.serial_thread.send("LED:0\n")
+
+        elif state == "error":
+            self.lbl_estado.setText("Error de conexión")
+            self.lbl_estado.setStyleSheet("color:#FF5555;")
+            self.update_controls_enabled(False)
+            self.set_connected_ui(False)
+
+        elif state == "closed":
+            self.lbl_estado.setText("Desconectado")
+            self.lbl_estado.setStyleSheet("color:#FF5555;")
+            self.update_controls_enabled(False)
+            self.set_connected_ui(False)
+            self.serial_thread = None
+
+    # callback RX
+    def on_serial_receive(self, data):
+        print("[RX]", data)
+
+    # ======================================================
+    # Lógica de botones
+    # ======================================================
+
+    def update_controls_enabled(self, e):
+        for btn in [self.btn_horn, self.btn_left, self.btn_right, self.btn_light]:
+            btn.setEnabled(e)
+
+    def refrescar(self):
+        if not self.connected:
+            self.cmb.clear()
+            self.cmb.addItems(listar_puertos())
+
+    def toggle_conexion(self):
+        if self.connected and self.serial_thread:
+            self.lbl_estado.setText("Desconectando…")
+            self.lbl_estado.setStyleSheet("color:#FFAA00;")
+            self.update_controls_enabled(False)
+            self.serial_thread.close()
+            return
+
+        puerto = self.cmb.currentText().split(" ")[0]
+        self.lbl_estado.setText("Conectando…")
+        self.lbl_estado.setStyleSheet("color:#FFAA00;")
+
+        self.serial_thread = SerialThread(puerto)
+        self.serial_thread.status.connect(self.on_serial_status)
+        self.serial_thread.received.connect(self.on_serial_receive)
+        self.serial_thread.connect()
+
+    # ======================================================
+    # Slider potencia WASD → PWM 127–255
+    # ======================================================
+
+    def on_power_change(self, value):
+        percent = value * 10   # 0..100%
+        pwm_min = 127
+        pwm_max = 255
+        pwm = pwm_min + int((pwm_max - pwm_min) * (percent / 100))
+        self.lbl_power.setText(f"Potencia WASD: {percent} %  (PWM {pwm})")
+
+    # ======================================================
+    # Teclado WASD + bocina
+    # ======================================================
+
+    def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            return
+
+        key = event.key()
+
+        if key == Qt.Key_Q:
+            self.horn_on()
+            return
+
+        if key in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+            self.movement_keys.add(key)
+            self.actualizar_desde_teclas()
+            return
+
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.isAutoRepeat():
+            return
+
+        key = event.key()
+
+        if key == Qt.Key_Q:
+            self.horn_off()
+            return
+
+        if key in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+            if key in self.movement_keys:
+                self.movement_keys.remove(key)
+            self.actualizar_desde_teclas()
+            return
+
+        super().keyReleaseEvent(event)
+
+    def actualizar_desde_teclas(self):
+        if not self.movement_keys:
+            self.override_pwm = False
+            self.L = 0
+            self.R = 0
+            self.lbl_mov.setText("Detenido")
+            return
+
+        # direcciones discretas
+        y = 0
+        x = 0
+        if Qt.Key_W in self.movement_keys: y += 1
+        if Qt.Key_S in self.movement_keys: y -= 1
+        if Qt.Key_D in self.movement_keys: x += 1
+        if Qt.Key_A in self.movement_keys: x -= 1
+
+        Ldir = max(-1, min(1, y + x))
+        Rdir = max(-1, min(1, y - x))
+
+        if Ldir == 0 and Rdir == 0:
+            self.override_pwm = False
+            self.L = 0
+            self.R = 0
+            self.lbl_mov.setText("Detenido")
+            return
+
+        self.override_pwm = True
+        self.L_dir = Ldir
+        self.R_dir = Rdir
+
+        self.L = Ldir * 100
+        self.R = Rdir * 100
+        self.lbl_mov.setText(f"L={self.L}  R={self.R}")
+
+    # ======================================================
+    # Bocina, golpes y luz
+    # ======================================================
+
+    def horn_on(self):
+        if self.serial_thread:
+            self.serial_thread.send("H:1\n")
+
+    def horn_off(self):
+        if self.serial_thread:
+            self.serial_thread.send("H:0\n")
+
+    def kick_left(self):
+        if self.serial_thread:
+            self.serial_thread.send("K:L\n")
+
+    def kick_right(self):
+        if self.serial_thread:
+            self.serial_thread.send("K:R\n")
+
+    def toggle_light(self):
+        if not self.serial_thread:
+            return
+        self.light_on = not self.light_on
+        if self.light_on:
+            self.serial_thread.send("LED:1\n")
+            self.btn_light.setText("Luz ON")
+        else:
+            self.serial_thread.send("LED:0\n")
+            self.btn_light.setText("Luz OFF")
+
+    # ======================================================
+    # Joystick analógico
+    # ======================================================
+
+    def procesar_joy(self, x, y):
+        if self.movement_keys:
+            return  # WASD domina
+
+        if abs(x) < 5: x = 0
+        if abs(y) < 5: y = 0
+
+        L = max(-100, min(100, y + x))
+        R = max(-100, min(100, y - x))
+
+        self.override_pwm = False
+        self.L = L
+        self.R = R
+
+        if L == 0 and R == 0:
+            self.lbl_mov.setText("Detenido")
+        else:
+            self.lbl_mov.setText(f"L={L}  R={R}")
+
+    # ======================================================
+    # PWM map + envío real
+    # ======================================================
+
+    def map_pwm(self, v):
+        if v == 0:
+            return 0
+
+        sign = 1 if v > 0 else -1
+        mag = abs(v)
+
+        if mag <= 5:
+            return 0
+
+        norm = ((mag - 5) / 95.0) ** 1.5
+        pwm = 160 + int(norm * (255 - 160))
+        pwm = min(255, pwm)
+
+        return sign * pwm
+
+    def enviar(self):
+        if not self.serial_thread or not self.connected:
+            return
+
+        if self.override_pwm:
+            percent = self.slider_power.value() * 10  # 0..100%
+            pwm_min = 127
+            pwm_max = 255
+
+            max_pwm = pwm_min + int((pwm_max - pwm_min) * (percent / 100))
+
+            Lpwm = max_pwm * (1 if self.L_dir > 0 else -1 if self.L_dir < 0 else 0)
+            Rpwm = max_pwm * (1 if self.R_dir > 0 else -1 if self.R_dir < 0 else 0)
+        else:
+            Lpwm = self.map_pwm(self.L)
+            Rpwm = self.map_pwm(self.R)
+
+        if abs(Lpwm - self.last_Lpwm) < 3 and abs(Rpwm - self.last_Rpwm) < 3:
+            return
+
+        self.last_Lpwm = Lpwm
+        self.last_Rpwm = Rpwm
+
+        self.serial_thread.send(f"L:{Lpwm} R:{Rpwm}\n")
+
+# ======================================================
+#   MAIN
+# ======================================================
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = Window()
+    w.show()
+    sys.exit(app.exec_())
