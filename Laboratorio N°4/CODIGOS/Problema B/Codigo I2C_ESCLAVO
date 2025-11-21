@@ -1,1 +1,152 @@
+// parte2e.c - ATmega328P ESCLAVO I2C
+// Recibe 3 bytes del maestro por I2C (dir 0x20):
+// 1) duty_pwm (0..255) -> PWM para motor en PD6 (OC0A / D6)
+// 2) flag_temp_mayor (0/1) -> pin PD7
+// 3) flag_boton (0/1) -> pin PD5
+
+#ifndef F_CPU
+#define F_CPU 16000000UL
+#endif
+
+#include <avr/io.h>
+#include <stdint.h>
+#include "pwm.h"   // PWM_INICIAR, PWM_ESTABLECER_DUTY
+
+// Direcci�n I2C de este esclavo (7 bits)
+#define ESCLAVO_I2C_DIR  0x20
+
+// LED/pin remoto temperatura > 27�C en PD7
+#define LED_TEMP_DDR   DDRD
+#define LED_TEMP_PORT  PORTD
+#define LED_TEMP_BIT   PD7
+
+// LED/pin remoto bot�n presionado en PD5
+#define LED_BTN_DDR    DDRD
+#define LED_BTN_PORT   PORTD
+#define LED_BTN_BIT    PD5
+
+// Inicializaci�n b�sica del TWI como esclavo I2C
+static void I2C_ESCLAVO_INICIAR(void)
+{
+	// Cargar direcci�n del esclavo (7 bits) en TWAR
+	TWAR = (ESCLAVO_I2C_DIR << 1);   // bit 0 reservado para general call
+
+	// Habilitar TWI, ACK y limpiar TWINT para estar listo a responder
+	TWCR = (1 << TWEN)  |  // Habilitar TWI
+	(1 << TWEA)  |  // Habilitar ACK autom�tico
+	(1 << TWINT);   // Limpiar TWINT
+}
+
+int main(void)
+{
+	uint8_t duty_pwm        = 0;
+	uint8_t flag_temp_mayor = 0;
+	uint8_t flag_boton      = 0;
+	uint8_t index           = 0;
+	uint8_t estado_twi      = 0;
+
+	//--- PWM en PD6 (OC0A / pin digital 6) ---
+	PWM_INICIAR(64);   // prescaler 64, ~1 kHz aprox.
+
+	//--- Pines digitales para las se�ales remotas ---
+	// PD7: pin para temperatura > 27�C
+	LED_TEMP_DDR  |= (1 << LED_TEMP_BIT);
+	LED_TEMP_PORT &= ~(1 << LED_TEMP_BIT); // apagado
+
+	// PD5: pin para pulsador
+	LED_BTN_DDR   |= (1 << LED_BTN_BIT);
+	LED_BTN_PORT  &= ~(1 << LED_BTN_BIT);  // apagado
+
+	//--- I2C como esclavo ---
+	I2C_ESCLAVO_INICIAR();
+
+	while (1)
+	{
+		// Esperar a que haya un evento TWI (TWINT=1)
+		while (!(TWCR & (1 << TWINT)))
+		{
+			// bucle de espera
+		}
+
+		// Leer estado (solo bits de estado, m�scara 0xF8)
+		estado_twi = TWSR & 0xF8;
+
+		switch (estado_twi)
+		{
+			// SLA+W recibido, ACK enviado
+			case 0x60:  // Own SLA+W received, ACK returned
+			case 0x68:  // Arbitration lost, own SLA+W received, ACK returned
+			index = 0; // empezar a contar bytes nuevos
+			// Preparar para recibir datos y responder con ACK
+			TWCR = (1 << TWEN) | (1 << TWEA) | (1 << TWINT);
+			break;
+
+			// Datos recibidos y ACK enviado
+			case 0x80:  // Data received, ACK returned
+			case 0x90:  // Data received after general call, ACK returned
+			{
+				uint8_t dato = TWDR;
+
+				if (index == 0)
+				{
+					duty_pwm = dato;          // 1er byte: PWM
+				}
+				else if (index == 1)
+				{
+					flag_temp_mayor = dato;   // 2� byte: temp>27
+				}
+				else if (index == 2)
+				{
+					flag_boton = dato;        // 3er byte: bot�n
+				}
+
+				index++;
+
+				// Si ya recibimos los 3 bytes, aplicar acciones
+				if (index >= 3)
+				{
+					// PWM al motor
+					PWM_ESTABLECER_DUTY(duty_pwm);
+
+					// Temperatura > 27�C -> PD7
+					if (flag_temp_mayor == 1)
+					{
+						LED_TEMP_PORT |= (1 << LED_TEMP_BIT);
+					}
+					else
+					{
+						LED_TEMP_PORT &= ~(1 << LED_TEMP_BIT);
+					}
+
+					// Bot�n presionado -> PD5
+					if (flag_boton == 1)
+					{
+						LED_BTN_PORT |= (1 << LED_BTN_BIT);
+					}
+					else
+					{
+						LED_BTN_PORT &= ~(1 << LED_BTN_BIT);
+					}
+				}
+
+				// Preparar para recibir siguiente dato (si lo hay) con ACK
+				TWCR = (1 << TWEN) | (1 << TWEA) | (1 << TWINT);
+				break;
+			}
+
+			// STOP o repeated START recibido -> fin de la transmisi�n actual
+			case 0xA0:  // STOP or repeated START condition received
+			// Preparar para nueva direcci�n
+			TWCR = (1 << TWEN) | (1 << TWEA) | (1 << TWINT);
+			break;
+
+			// Cualquier otro estado: reset simple del TWI para seguir atendiendo
+			default:
+			TWCR = (1 << TWEN) | (1 << TWEA) | (1 << TWINT);
+			break;
+		}
+	}
+
+	return 0;
+}
 
